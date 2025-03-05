@@ -69,6 +69,18 @@ def resize_image(cfg, x):
         x["obs"]["wrist_image"] = resized_tensor.view(B, T, C, resize, resize)
         del x["obs"]["robot0_eye_in_hand_image"]
 
+    elif "kf_data" in cfg.task.name:
+        B, T, C, H, W = x["obs"]["camera_0_rgb"].shape
+        resized_tensor = F.interpolate(
+            x["obs"]["camera_0_rgb"].contiguous().view(B * T, C, H, W),
+            size=(resize, resize),
+            mode="bilinear",
+            align_corners=False,
+        )
+        x["obs"]["image"] = resized_tensor.view(B, T, C, resize, resize)
+        del x["obs"]["camera_0_rgb"]
+            
+
     else:
         B, T, C, H, W = x["obs"]["image"].shape
         if resize != H:

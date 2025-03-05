@@ -1,0 +1,34 @@
+name: kf_data
+task_type: single_dataset
+task_modes: []
+
+shape_meta:
+  image_resolution: 128
+  action:
+    shape:
+    - 10
+  obs:
+    camera_0_rgb:
+      shape:
+      - 3 # C
+      - 128 # H
+      - 128 # W
+      type: rgb
+
+dataset:
+  _target_: unified_video_action.dataset.kf_dataset.KFDataset
+  language_emb_model: null
+  normalizer_type: all
+  dataset_dir: data/kf_data/1018_rope_short/recording_1
+  horizon: 32
+  skip_frame: 1
+  pad_after: 7
+  pad_before: 1
+  rotation_rep: rotation_6d
+  seed: 42
+  val_ratio: 0.1
+  skip_idx: 20
+  use_cache: true
+  resolution: 128
+  obs_keys: [camera_0_rgb]
+  shape_meta: ${task.shape_meta}
