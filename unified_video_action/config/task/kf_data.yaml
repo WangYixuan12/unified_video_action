@@ -21,13 +21,13 @@ dataset:
   normalizer_type: all
   dataset_dir: data/kf_data/1018_rope_short/recording_1
   horizon: 32
-  skip_frame: 1
+  skip_frame: 3
   pad_after: 7
   pad_before: 1
   rotation_rep: rotation_6d
   seed: 42
   val_ratio: 0.1
-  skip_idx: 20
+  skip_idx: 50
   use_cache: true
   resolution: 128
   obs_keys: [camera_0_rgb]
