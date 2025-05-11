@@ -79,7 +79,17 @@ def resize_image(cfg, x):
         )
         x["obs"]["image"] = resized_tensor.view(B, T, C, resize, resize)
         del x["obs"]["camera_0_rgb"]
-            
+    
+    elif "sim_aloha_data" in cfg.task.name:
+        B, T, C, H, W = x["obs"]["top_pov"].shape
+        resized_tensor = F.interpolate(
+            x["obs"]["top_pov"].contiguous().view(B * T, C, H, W),
+            size=(resize, resize),
+            mode="bilinear",
+            align_corners=False,
+        )
+        x["obs"]["image"] = resized_tensor.view(B, T, C, resize, resize)
+        del x["obs"]["top_pov"]
 
     else:
         B, T, C, H, W = x["obs"]["image"].shape

@@ -1,6 +1,5 @@
-from typing import Union, Dict
+from typing import Any, Callable, Dict, Optional, Union
 
-import unittest
 import zarr
 import numpy as np
 import torch
@@ -10,20 +9,23 @@ from unified_video_action.model.common.dict_of_tensor_mixin import DictOfTensorM
 
 
 class LinearNormalizer(DictOfTensorMixin):
+    """Linear Normalizer."""
+
     avaliable_modes = ["limits", "gaussian"]
 
     @torch.no_grad()
     def fit(
         self,
         data: Union[Dict, torch.Tensor, np.ndarray, zarr.Array],
-        last_n_dims=1,
-        dtype=torch.float32,
-        mode="limits",
-        output_max=1.0,
-        output_min=-1.0,
-        range_eps=1e-4,
-        fit_offset=True,
-    ):
+        last_n_dims: int = 1,
+        dtype: torch.dtype = torch.float32,
+        mode: str = "limits",
+        output_max: float = 1.0,
+        output_min: float = -1.0,
+        range_eps: float = 1e-4,
+        fit_offset: bool = True,
+    ) -> None:
+        """Fit the normalizer."""
         if isinstance(data, dict):
             for key, value in data.items():
                 self.params_dict[key] = _fit(
@@ -49,15 +51,18 @@ class LinearNormalizer(DictOfTensorMixin):
             )
 
     def __call__(self, x: Union[Dict, torch.Tensor, np.ndarray]) -> torch.Tensor:
+        """Normalize the input."""
         return self.normalize(x)
 
-    def __getitem__(self, key: str):
+    def __getitem__(self, key: str) -> "SingleFieldLinearNormalizer":
         return SingleFieldLinearNormalizer(self.params_dict[key])
 
-    def __setitem__(self, key: str, value: "SingleFieldLinearNormalizer"):
+    def __setitem__(self, key: str, value: "SingleFieldLinearNormalizer") -> None:
         self.params_dict[key] = value.params_dict
 
-    def _normalize_impl(self, x, forward=True):
+    def _normalize_impl(
+        self, x: Union[Dict, torch.Tensor, np.ndarray], forward: bool = True
+    ) -> torch.Tensor:
         if isinstance(x, dict):
             result = dict()
             for key, value in x.items():
@@ -71,12 +76,15 @@ class LinearNormalizer(DictOfTensorMixin):
             return _normalize(x, params, forward=forward)
 
     def normalize(self, x: Union[Dict, torch.Tensor, np.ndarray]) -> torch.Tensor:
+        """Normalize the input."""
         return self._normalize_impl(x, forward=True)
 
     def unnormalize(self, x: Union[Dict, torch.Tensor, np.ndarray]) -> torch.Tensor:
+        """Unnormalize the input."""
         return self._normalize_impl(x, forward=False)
 
     def get_input_stats(self) -> Dict:
+        """Return the input stats."""
         if len(self.params_dict) == 0:
             raise RuntimeError("Not initialized")
         if len(self.params_dict) == 1 and "_default" in self.params_dict:
@@ -88,7 +96,8 @@ class LinearNormalizer(DictOfTensorMixin):
                 result[key] = value["input_stats"]
         return result
 
-    def get_output_stats(self, key="_default"):
+    def get_output_stats(self, key: str = "_default") -> Dict:
+        """Return the output stats."""
         input_stats = self.get_input_stats()
         if "min" in input_stats:
             # no dict
@@ -104,20 +113,23 @@ class LinearNormalizer(DictOfTensorMixin):
 
 
 class SingleFieldLinearNormalizer(DictOfTensorMixin):
+    """Single Field Linear Normalizer."""
+
     avaliable_modes = ["limits", "gaussian"]
 
     @torch.no_grad()
     def fit(
         self,
         data: Union[torch.Tensor, np.ndarray, zarr.Array],
-        last_n_dims=1,
-        dtype=torch.float32,
-        mode="limits",
-        output_max=1.0,
-        output_min=-1.0,
-        range_eps=1e-4,
-        fit_offset=True,
-    ):
+        last_n_dims: int = 1,
+        dtype: torch.dtype = torch.float32,
+        mode: str = "limits",
+        output_max: float = 1.0,
+        output_min: float = -1.0,
+        range_eps: float = 1e-4,
+        fit_offset: bool = True,
+    ) -> None:
+        """Fit the normalizer."""
         self.params_dict = _fit(
             data,
             last_n_dims=last_n_dims,
@@ -130,26 +142,33 @@ class SingleFieldLinearNormalizer(DictOfTensorMixin):
         )
 
     @classmethod
-    def create_fit(cls, data: Union[torch.Tensor, np.ndarray, zarr.Array], **kwargs):
+    def create_fit(
+        cls: Callable,
+        data: Union[torch.Tensor, np.ndarray, zarr.Array],
+        **kwargs: Dict[str, Any]
+    ) -> "SingleFieldLinearNormalizer":
+        """Create a normalizer by fitting the data."""
         obj = cls()
         obj.fit(data, **kwargs)
         return obj
 
     @classmethod
     def create_manual(
-        cls,
+        cls: Callable,
         scale: Union[torch.Tensor, np.ndarray],
         offset: Union[torch.Tensor, np.ndarray],
         input_stats_dict: Dict[str, Union[torch.Tensor, np.ndarray]],
-    ):
-        def to_tensor(x):
+    ) -> "SingleFieldLinearNormalizer":
+        """Create a normalizer manually."""
+
+        def to_tensor(x: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
             if not isinstance(x, torch.Tensor):
                 x = torch.from_numpy(x)
             x = x.flatten()
             return x
 
         # check
-        for x in [offset] + list(input_stats_dict.values()):
+        for x in [offset, *input_stats_dict.values()]:
             assert x.shape == scale.shape
             assert x.dtype == scale.dtype
 
@@ -165,7 +184,10 @@ class SingleFieldLinearNormalizer(DictOfTensorMixin):
         return cls(params_dict)
 
     @classmethod
-    def create_identity(cls, dtype=torch.float32):
+    def create_identity(
+        cls: Callable, dtype: torch.dtype = torch.float32
+    ) -> "SingleFieldLinearNormalizer":
+        """Create an identity normalizer."""
         scale = torch.tensor([1], dtype=dtype)
         offset = torch.tensor([0], dtype=dtype)
         input_stats_dict = {
@@ -174,34 +196,39 @@ class SingleFieldLinearNormalizer(DictOfTensorMixin):
             "mean": torch.tensor([0], dtype=dtype),
             "std": torch.tensor([1], dtype=dtype),
         }
-        return cls.create_manual(scale, offset, input_stats_dict)
+        return cls.create_manual(scale, offset, input_stats_dict)  # type: ignore
 
     def normalize(self, x: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
+        """Normalize the input."""
         return _normalize(x, self.params_dict, forward=True)
 
     def unnormalize(self, x: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
+        """Unnormalize the input."""
         return _normalize(x, self.params_dict, forward=False)
 
-    def get_input_stats(self):
+    def get_input_stats(self) -> Dict:
+        """Return the input stats."""
         return self.params_dict["input_stats"]
 
-    def get_output_stats(self):
+    def get_output_stats(self) -> Dict:
+        """Return the output stats."""
         return dict_apply(self.params_dict["input_stats"], self.normalize)
 
     def __call__(self, x: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
+        """Normalize the input."""
         return self.normalize(x)
 
 
 def _fit(
     data: Union[torch.Tensor, np.ndarray, zarr.Array],
-    last_n_dims=1,
-    dtype=torch.float32,
-    mode="limits",
-    output_max=1.0,
-    output_min=-1.0,
-    range_eps=1e-4,
-    fit_offset=True,
-):
+    last_n_dims: int = 1,
+    dtype: torch = torch.float32,
+    mode: str = "limits",
+    output_max: float = 1.0,
+    output_min: float = -1.0,
+    range_eps: float = 1e-4,
+    fit_offset: bool = True,
+) -> nn.ParameterDict:
     assert mode in ["limits", "gaussian"]
     assert last_n_dims >= 0
     assert output_max > output_min
@@ -280,7 +307,11 @@ def _fit(
     return this_params
 
 
-def _normalize(x, params, forward=True):
+def _normalize(
+    x: Union[np.ndarray, torch.Tensor],
+    params: dict[str, torch.Tensor],
+    forward: bool = True,
+) -> torch.Tensor:
     assert "scale" in params
     if isinstance(x, np.ndarray):
         x = torch.from_numpy(x)
@@ -297,7 +328,7 @@ def _normalize(x, params, forward=True):
     return x
 
 
-def test():
+def test() -> None:
     data = torch.zeros((100, 10, 9, 2)).uniform_()
     data[..., 0, 0] = 0
 
@@ -309,9 +340,6 @@ def test():
     assert np.allclose(datan.min(), -1.0)
     dataun = normalizer.unnormalize(datan)
     assert torch.allclose(data, dataun, atol=1e-7)
-
-    input_stats = normalizer.get_input_stats()
-    output_stats = normalizer.get_output_stats()
 
     normalizer = SingleFieldLinearNormalizer()
     normalizer.fit(data, mode="limits", last_n_dims=1, fit_offset=False)
@@ -345,9 +373,6 @@ def test():
     dataun = normalizer.unnormalize(datan)
     assert torch.allclose(data, dataun, atol=1e-7)
 
-    input_stats = normalizer.get_input_stats()
-    output_stats = normalizer.get_output_stats()
-
     data = {
         "obs": torch.zeros((1000, 128, 9, 2)).uniform_() * 512,
         "action": torch.zeros((1000, 128, 2)).uniform_() * 512,
@@ -359,9 +384,6 @@ def test():
     for key in data:
         assert torch.allclose(data[key], dataun[key], atol=1e-4)
 
-    input_stats = normalizer.get_input_stats()
-    output_stats = normalizer.get_output_stats()
-
     state_dict = normalizer.state_dict()
     n = LinearNormalizer()
     n.load_state_dict(state_dict)
@@ -370,9 +392,14 @@ def test():
     for key in data:
         assert torch.allclose(data[key], dataun[key], atol=1e-4)
 
+
 def get_range_normalizer_from_stat(
-    stat, output_max=1, output_min=-1, range_eps=1e-7, ignore_dim=None
-):
+    stat: Dict[str, np.ndarray],
+    output_max: float = 1,
+    output_min: float = -1,
+    range_eps: float = 1e-7,
+    ignore_dim: Optional[np.ndarray] = None,
+) -> SingleFieldLinearNormalizer:
     # -1, 1 normalization
     input_max = stat["max"]
     input_min = stat["min"]
@@ -389,7 +416,7 @@ def get_range_normalizer_from_stat(
     )
 
 
-def get_image_range_normalizer():
+def get_image_range_normalizer() -> SingleFieldLinearNormalizer:
     scale = np.array([2], dtype=np.float32)
     offset = np.array([-1], dtype=np.float32)
     stat = {
@@ -403,7 +430,7 @@ def get_image_range_normalizer():
     )
 
 
-def get_depth_range_normalizer():
+def get_depth_range_normalizer() -> SingleFieldLinearNormalizer:
     scale = np.array([2], dtype=np.float32)
     offset = np.array([-1], dtype=np.float32)
     stat = {
@@ -417,14 +444,37 @@ def get_depth_range_normalizer():
     )
 
 
-def get_identity_normalizer_from_stat(stat):
+def get_identity_normalizer_from_stat(
+    stat: Dict[str, np.ndarray]
+) -> SingleFieldLinearNormalizer:
     scale = np.ones_like(stat["min"])
     offset = np.zeros_like(stat["min"])
     return SingleFieldLinearNormalizer.create_manual(
         scale=scale, offset=offset, input_stats_dict=stat
     )
 
-def array_to_stats(arr: np.ndarray):
+
+def get_hundred_times_normalizer_from_stat(
+    stat: Dict[str, np.ndarray]
+) -> SingleFieldLinearNormalizer:
+    scale = np.ones_like(stat["min"]) * 100
+    offset = np.zeros_like(stat["min"])
+    return SingleFieldLinearNormalizer.create_manual(
+        scale=scale, offset=offset, input_stats_dict=stat
+    )
+
+
+def get_twenty_times_normalizer_from_stat(
+    stat: Dict[str, np.ndarray]
+) -> SingleFieldLinearNormalizer:
+    scale = np.ones_like(stat["min"]) * 20
+    offset = np.zeros_like(stat["min"])
+    return SingleFieldLinearNormalizer.create_manual(
+        scale=scale, offset=offset, input_stats_dict=stat
+    )
+
+
+def array_to_stats(arr: np.ndarray) -> Dict[str, np.ndarray]:
     stat = {
         "min": np.min(arr, axis=0),
         "max": np.max(arr, axis=0),

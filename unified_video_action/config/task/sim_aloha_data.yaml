@@ -1,0 +1,36 @@
+name: sim_aloha_data
+task_type: single_dataset
+task_modes: []
+
+shape_meta:
+  image_resolution: 128
+  action:
+    shape:
+    - 10
+  obs:
+    top_pov:
+      shape:
+      - 3 # C
+      - 128 # H
+      - 128 # W
+      type: rgb
+
+dataset:
+  _target_: unified_video_action.dataset.sim_aloha_dataset.SimAlohaDataset
+  language_emb_model: null
+  normalizer_type: all
+  dataset_dir: data/sim_aloha_data/1018_rope_short/recording_1
+  horizon: 32
+  skip_frame: 5
+  pad_after: 7
+  pad_before: 1
+  rotation_rep: rotation_6d
+  seed: 42
+  val_ratio: 0.1
+  skip_idx: 50
+  use_cache: true
+  resolution: 128
+  obs_keys: [top_pov]
+  shape_meta: ${task.shape_meta}
+  delta_action: false
+  action_mode: bimanual_push

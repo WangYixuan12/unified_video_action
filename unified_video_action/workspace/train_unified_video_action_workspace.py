@@ -131,7 +131,7 @@ class TrainUnifiedVideoActionWorkspace(BaseWorkspace):
         else:
             # configure dataset
             dataset: BaseImageDataset
-            if cfg.task.dataset._target_ == 'unified_video_action.dataset.kf_dataset.KFDataset':
+            if cfg.task.dataset._target_ in ['unified_video_action.dataset.kf_dataset.KFDataset', 'unified_video_action.dataset.sim_aloha_dataset.SimAlohaDataset']:
                 dataset_class = hydra.utils.get_class(cfg.task.dataset._target_)
                 dataset = dataset_class(cfg.task.dataset)
             else:
