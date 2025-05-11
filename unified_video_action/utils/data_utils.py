@@ -1,5 +1,6 @@
 import random
 import numpy as np
+import cv2
 import sys
 
 sys.path.extend([sys.path[0][:-4], "/app"])
@@ -466,7 +467,17 @@ def save_image_grid(img, fname, drange, grid_size, normalize=True):
     assert C in [3]
 
     if C == 3:
-        torchvision.io.write_video(f"{fname[:-3]}mp4", torch.from_numpy(img), fps=16)
+        vid_writer = cv2.VideoWriter(
+            f"{fname[:-3]}mp4",
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            1,
+            (img.shape[2], img.shape[1]),
+        )
+        for i in range(img.shape[0]):
+            img_i = img[i]
+            img_i = cv2.cvtColor(img_i, cv2.COLOR_RGB2BGR)
+            vid_writer.write(img_i)
+        vid_writer.release()
         imgs = [PIL.Image.fromarray(img[i], "RGB") for i in range(len(img))]
         imgs[0].save(
             fname,

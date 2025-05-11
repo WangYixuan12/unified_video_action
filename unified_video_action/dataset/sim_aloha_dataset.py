@@ -5,6 +5,7 @@ import os
 import shutil
 from pathlib import Path
 from typing import Dict, Optional
+import copy
 
 import cv2
 import h5py
@@ -540,6 +541,18 @@ class SimAlohaDataset(BaseImageDataset):
         }
         return data
 
+    def get_validation_dataset(self):
+        val_set = copy.copy(self)
+        val_set.sampler = SequenceSampler(
+            replay_buffer=self.replay_buffer,
+            sequence_length=self.horizon,
+            pad_before=self.pad_before,
+            pad_after=self.pad_after,
+            episode_mask=~self.train_mask,
+        )
+        val_set.train_mask = ~self.train_mask
+        return val_set
+    
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
         data = self._sample_to_data(sample)
