@@ -474,7 +474,7 @@ class SimAlohaDataset(BaseImageDataset):
 
     def _sample_to_data(self, sample: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         obs_dict = dict()
-        skip_start = np.random.randint(0, self.skip_frame) + self.skip_frame
+        skip_start = np.random.randint(0, self.skip_frame)
         for key in self.rgb_keys:
             # move channel last to channel first
             # T,H,W,C
@@ -497,12 +497,7 @@ class SimAlohaDataset(BaseImageDataset):
             del sample[key]
 
         actions = sample["action"].astype(np.float32)
-        action_dim = actions.shape[-1]
-        downsample_horizon = actions.shape[0] // self.skip_frame - 1
-        action_len = downsample_horizon * self.skip_frame
-        action_start = skip_start - self.skip_frame
-        actions = actions[action_start : action_start + action_len]
-        actions = actions.reshape(downsample_horizon, self.skip_frame, action_dim)
+        actions = actions[skip_start :: self.skip_frame]
         if self.delta_action:
             joint_pos = obs_dict["joint_pos"].astype(np.float32)
             robot_bases = self.robot_bases
@@ -534,7 +529,6 @@ class SimAlohaDataset(BaseImageDataset):
                 ) / 100
             else:
                 raise NotImplementedError
-        actions = actions.reshape(downsample_horizon, self.skip_frame * action_dim)
         data = {
             "obs": dict_apply(obs_dict, torch.from_numpy),
             "action": torch.from_numpy(actions),

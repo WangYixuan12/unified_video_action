@@ -41,15 +41,6 @@ from .base_dataset import BaseImageDataset
 register_codecs()
 
 
-def normalizer_from_stat(stat: Dict[str, np.ndarray]) -> LinearNormalizer:
-    max_abs = np.maximum(stat["max"].max(), np.abs(stat["min"]).max())
-    scale = np.full_like(stat["max"], fill_value=1 / max_abs)
-    offset = np.zeros_like(stat["max"])
-    return SingleFieldLinearNormalizer.create_manual(
-        scale=scale, offset=offset, input_stats_dict=stat
-    )
-
-
 def read_one_episode(
     dataset_path: str, h: int, w: int
 ) -> tuple[dict, dict, np.ndarray]:
@@ -516,7 +507,7 @@ class KFDataset(BaseImageDataset):
         else:
             action = self.replay_buffer["action"]
         stat = array_to_stats(action)
-        this_normalizer = normalizer_from_stat(stat)
+        this_normalizer = get_range_normalizer_from_stat(stat)
         normalizer["action"] = this_normalizer
 
         # obs
