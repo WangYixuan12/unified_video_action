@@ -320,7 +320,7 @@ class SimAlohaDataset(BaseImageDataset):
         # assign config
         shape_meta = cfg.shape_meta
         dataset_dir = cfg.dataset_dir
-        horizon = (cfg.horizon + 1) * cfg.skip_frame
+        horizon = cfg.horizon * cfg.skip_frame
         pad_before = cfg.pad_before
         pad_after = cfg.pad_after
         use_cache = cfg.use_cache
