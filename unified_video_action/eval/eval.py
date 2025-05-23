@@ -38,6 +38,7 @@ def prepare_data_predict_action(
         normalizer_type=model.normalizer_type,
         actions=actions,
     )
+    # nactions = torch.zeros((1,2,1))
     x = normalize_obs(
         normalizer=model.normalizer, normalizer_type=model.normalizer_type, batch=x
     )
@@ -134,6 +135,8 @@ def test_video_fvd(
 
             actions = actions[:k]
             x = dict_apply(x, lambda x: x[:k])
+            # actions = None
+            # del x["action"]
 
             if cfg.task.dataset.language_emb_model is not None:
                 if "language" in x["obs"]:
