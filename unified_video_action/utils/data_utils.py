@@ -175,7 +175,6 @@ def select_frames(x, T, eval=False, select_timesteps=4, different_history_freq=F
                     indices[indices.shape[0] // 2 :],
                 ]
             )
-
     x = x[:, indices, :, :, :]
 
     return x, indices

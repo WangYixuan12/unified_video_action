@@ -1,0 +1,37 @@
+name: dinowm_pusht
+task_type: single_dataset
+task_modes: []
+
+shape_meta:
+  action:
+    shape:
+    - 2
+  obs:
+    proprios:
+      shape:
+      - 4
+    image:
+      shape:
+      - 3 # C
+      - 256
+      - 256
+      type: rgb
+
+dataset:
+  _target_: unified_video_action.dataset.dinowm_pusht_dataset.DINOWMPushTDataset
+  language_emb_model: null
+  normalizer_type: all
+  dataset_dir: data/sim_aloha/transfer_cube_0301
+  horizon: 32
+  skip_frame: 1
+  pad_after: 7
+  pad_before: 1
+  rotation_rep: rotation_6d
+  seed: 42
+  skip_idx: 50
+  use_cache: false
+  resolution: 256
+  shape_meta: ${task.shape_meta}
+  obs_keys: [image]
+  low_dim_keys: []
+  is_val: false
