@@ -319,7 +319,6 @@ def _normalize(
     offset = params["offset"]
     x = x.to(device=scale.device, dtype=scale.dtype)
     src_shape = x.shape
-    x = x.reshape(-1, scale.shape[0])
     if forward:
         x = x * scale + offset
     else:
