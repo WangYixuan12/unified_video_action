@@ -1,92 +1,41 @@
 import concurrent.futures
+import copy
+import gc
 import glob
 import multiprocessing
 import os
 import shutil
 from pathlib import Path
 from typing import Dict, Optional
-import copy
 
 import cv2
 import h5py
-import imageio
 import numpy as np
+import psutil
 import torch
 import zarr
 import zarr.storage
 from filelock import FileLock
+from imgaug import augmenters as iaa
 from omegaconf import DictConfig, OmegaConf
-from pytorch3d.transforms import matrix_to_rotation_6d
 from tqdm import tqdm
 from yixuan_utilities.draw_utils import center_crop
-from yixuan_utilities.kinematics_helper import KinHelper
 
 from unified_video_action.codecs.imagecodecs_numcodecs import Jpeg2k, register_codecs
 from unified_video_action.model.common.normalizer import (
     LinearNormalizer,
     array_to_stats,
-    get_hundred_times_normalizer_from_stat,
     get_identity_normalizer_from_stat,
     get_image_range_normalizer,
     get_range_normalizer_from_stat,
 )
 from unified_video_action.common.pytorch_util import dict_apply
 from unified_video_action.common.replay_buffer import ReplayBuffer
-from unified_video_action.common.sampler import SequenceSampler, get_val_mask
+from unified_video_action.common.sampler import SequenceSampler
 
 from .base_dataset import BaseImageDataset
 
 register_codecs()
-
-
-def _convert_ee_actions(
-    raw_actions: np.ndarray, joint_actions: np.ndarray
-) -> np.ndarray:
-    T, S, _, _, _ = raw_actions.shape
-
-    pos = raw_actions[:, :, 0, :3, 3]  # (T, S, 3)
-    mat = raw_actions[:, :, 0, :3, :3]  # (T, S, 3, 3)
-    rot = matrix_to_rotation_6d(torch.from_numpy(mat.reshape(-1, 3, 3)))
-    rot = rot.reshape(T, S, -1)  # (T, S, 6)
-    gripper = joint_actions[:, 6::7][..., None]  # (T, S)
-    cvt_actions = np.concatenate([pos, rot, gripper], axis=-1).astype(np.float32)
-    cvt_actions = cvt_actions.reshape(T, -1)  # (T, S*10)
-    return cvt_actions
-
-
-def _convert_to_single_ee_actions(
-    raw_actions: np.ndarray, joint_actions: np.ndarray
-) -> np.ndarray:
-    pos = raw_actions[:, 1, 0, :3, 3]  # (T, 3)
-    gripper = joint_actions[:, 6 + 7][..., None]  # (T, 1)
-    cvt_actions = np.concatenate([pos, gripper], axis=-1).astype(np.float32)  # (T, 4)
-    return cvt_actions
-
-
-def _convert_to_bimanual_push_actions(
-    raw_actions: np.ndarray, joint_actions: np.ndarray, robot_bases: np.ndarray
-) -> np.ndarray:
-    T, S, _, _, _ = raw_actions.shape
-    modified_raw_actions = np.zeros_like(raw_actions)
-    for i in range(S):
-        ee_pose = raw_actions[:, i, 0]  # (T, 4, 4)
-        world_t_robot_base = robot_bases[i]  # (4, 4)
-        world_t_robot_base = np.tile(world_t_robot_base[None], (T, 1, 1))
-        ee_pose = np.linalg.inv(world_t_robot_base) @ ee_pose  # (T, 4, 4)
-        theta = np.pi * 5.0 / 12.0
-        ee_pose[:, :3, :3] = np.array(
-            [
-                [np.sin(theta), 0.0, np.cos(theta)],
-                [0.0, 1.0, 0.0],
-                [-np.cos(theta), 0.0, np.sin(theta)],
-            ]
-        )
-        ee_pose[:, 0, 3] = np.clip(ee_pose[:, 0, 3], 0.25, 1.0)
-        ee_pose[:, 1, 3] = np.clip(ee_pose[:, 1, 3], -0.25, 0.25)
-        ee_pose[:, 2, 3] = 0.02
-        ee_pose = world_t_robot_base @ ee_pose
-        modified_raw_actions[:, i, 0] = ee_pose
-    return modified_raw_actions[:, :, 0, :2, 3].reshape(T, 4)
 
 
 # convert raw hdf5 data to replay buffer, which is used for diffusion policy training
@@ -96,7 +45,6 @@ def _convert_real_to_dp_replay(
     dataset_dir: str,
     n_workers: Optional[int] = None,
     max_inflight_tasks: Optional[int] = None,
-    action_mode: str = "bimanual_push",
 ) -> ReplayBuffer:
     if n_workers is None:
         n_workers = multiprocessing.cpu_count()
@@ -137,48 +85,19 @@ def _convert_real_to_dp_replay(
         dataset_path = os.path.join(dataset_dir, f"episode_{epi_idx}.hdf5")
         with h5py.File(dataset_path) as file:
             # count total steps
-            episode_length = file["ee_action"].shape[0]
+            episode_length = file["action"].shape[0]
             episode_end = prev_end + episode_length
             prev_end = episode_end
             episode_ends.append(episode_end)
 
             # save lowdim data to lowedim_data_dict
-            for key in [*lowdim_keys, "action"]:
-                data_key = "obs/" + key
-                if key == "action":
-                    data_key = (
-                        "ee_action"
-                        if "key" not in shape_meta["action"]
-                        else shape_meta["action"]["key"]
-                    )
-                if key not in lowdim_data_dict:
-                    lowdim_data_dict[key] = list()
-                this_data = file[data_key][()]
-                if key == "action" and data_key == "ee_action":
-                    # this_data = _convert_ee_actions(
-                    #     raw_actions=this_data,
-                    #     joint_actions=file["joint_action"][()],
-                    # )
-                    if action_mode == "bimanual_push":
-                        this_data = _convert_to_bimanual_push_actions(
-                            raw_actions=this_data,
-                            joint_actions=file["joint_action"][()],
-                            robot_bases=file["robot_bases"][0],
-                        )
-                    elif action_mode == "single_ee":
-                        this_data = _convert_to_single_ee_actions(
-                            raw_actions=this_data,
-                            joint_actions=file["joint_action"][()],
-                        )
-                    assert this_data.shape[0] == episode_length
-                    assert this_data.shape[1:] == shape_meta["action"]["shape"]
-                elif key == "action" and data_key == "joint_action":
-                    assert this_data.shape[0] == episode_length
-                    assert this_data.shape[1:] == shape_meta["action"]["shape"]
-                else:
-                    assert this_data.shape[0] == episode_length
-                    assert this_data.shape[1:] == shape_meta["obs"][key]["shape"]
-                lowdim_data_dict[key].append(this_data)
+            if "action" not in lowdim_data_dict:
+                lowdim_data_dict["action"] = list()
+            this_data = file["obs"]["ee_pos"][()]  # (T, 2, 4, 4)
+            action_data = np.concatenate(
+                [this_data[:, 0, :2, 3], this_data[:, 1, :2, 3]], axis=1
+            )  # (T, 4)
+            lowdim_data_dict["action"].append(action_data)
 
             for key in rgb_keys:
                 if key not in rgb_data_dict:
@@ -311,6 +230,47 @@ def _convert_real_to_dp_replay(
     return replay_buffer
 
 
+def load_replay_buffer(
+    dataset_dir: str, use_cache: bool, shape_meta: dict
+) -> ReplayBuffer:
+    replay_buffer = None
+    if use_cache:
+        cache_info_str = ""
+        cache_zarr_path = os.path.join(dataset_dir, f"cache{cache_info_str}.zarr.zip")
+        cache_lock_path = cache_zarr_path + ".lock"
+        print("Acquiring lock on cache.")
+        with FileLock(cache_lock_path):
+            if not os.path.exists(cache_zarr_path):
+                try:
+                    print("Cache does not exist. Creating!")
+                    # store = zarr.DirectoryStore(cache_zarr_path)
+                    replay_buffer = _convert_real_to_dp_replay(
+                        store=zarr.MemoryStore(),
+                        shape_meta=shape_meta,
+                        dataset_dir=dataset_dir,
+                    )
+                    print("Saving cache to disk.")
+                    with zarr.ZipStore(cache_zarr_path) as zip_store:
+                        replay_buffer.save_to_store(store=zip_store)
+                except Exception as e:
+                    shutil.rmtree(cache_zarr_path)
+                    raise e
+            else:
+                print("Loading cached ReplayBuffer from Disk.")
+                with zarr.ZipStore(cache_zarr_path, mode="r") as zip_store:
+                    replay_buffer = ReplayBuffer.copy_from_store(
+                        src_store=zip_store, store=zarr.MemoryStore()
+                    )
+                print("Loaded!")
+    else:
+        replay_buffer = _convert_real_to_dp_replay(
+            store=zarr.MemoryStore(),
+            shape_meta=shape_meta,
+            dataset_dir=dataset_dir,
+        )
+    return replay_buffer
+
+
 class SimAlohaDataset(BaseImageDataset):
     """A dataset for the real-world data collected on Aloha robot."""
 
@@ -324,61 +284,35 @@ class SimAlohaDataset(BaseImageDataset):
         pad_before = cfg.pad_before
         pad_after = cfg.pad_after
         use_cache = cfg.use_cache
-        seed = cfg.seed
-        val_ratio = cfg.val_ratio
-        manual_val_mask = cfg.manual_val_mask if "manual_val_mask" in cfg else False
-        manual_val_start = cfg.manual_val_start if "manual_val_start" in cfg else -1
         self.val_horizon = (
-            (cfg.val_horizon + 1) * cfg.skip_frame if "val_horizon" in cfg else horizon
+            cfg.val_horizon * cfg.skip_frame if "val_horizon" in cfg else horizon
         )
         self.skip_idx = cfg.skip_idx if "skip_idx" in cfg else 1
-        self.action_mode = cfg.action_mode
-
-        replay_buffer = None
-        with h5py.File(f"{dataset_dir}/episode_0.hdf5") as file:
-            self.robot_bases = file["robot_bases"][0].copy()
-        if use_cache:
-            cache_info_str = ""
-            obs_shape_meta = shape_meta["obs"]
-            for _, attr in obs_shape_meta.items():
-                type = attr.get("type", "low_dim")
-            cache_zarr_path = os.path.join(
-                dataset_dir, f"cache{cache_info_str}.zarr.zip"
+        self.aug_mode = cfg.aug_mode
+        if cfg.aug_mode == "img_aug":
+            self.aug = iaa.Sequential(
+                [
+                    iaa.Affine(
+                        translate_percent={"x": (-0.2, 0.2), "y": (-0.2, 0.2)},
+                        rotate=(-30, 30),
+                        mode="edge",
+                    ),
+                    iaa.AdditiveGaussianNoise(
+                        loc=0, scale=(0.0, 0.05), per_channel=0.5
+                    ),
+                    iaa.MultiplyHueAndSaturation(
+                        mul_hue=(0.8, 1.2), mul_saturation=(0.8, 1.2)
+                    ),
+                    iaa.MultiplyBrightness(mul=(0.8, 1.2)),
+                ]
             )
-            cache_lock_path = cache_zarr_path + ".lock"
-            print("Acquiring lock on cache.")
-            with FileLock(cache_lock_path):
-                if not os.path.exists(cache_zarr_path):
-                    try:
-                        print("Cache does not exist. Creating!")
-                        # store = zarr.DirectoryStore(cache_zarr_path)
-                        replay_buffer = _convert_real_to_dp_replay(
-                            store=zarr.MemoryStore(),
-                            shape_meta=shape_meta,
-                            dataset_dir=dataset_dir,
-                            action_mode=self.action_mode,
-                        )
-                        print("Saving cache to disk.")
-                        with zarr.ZipStore(cache_zarr_path) as zip_store:
-                            replay_buffer.save_to_store(store=zip_store)
-                    except Exception as e:
-                        shutil.rmtree(cache_zarr_path)
-                        raise e
-                else:
-                    print("Loading cached ReplayBuffer from Disk.")
-                    with zarr.ZipStore(cache_zarr_path, mode="r") as zip_store:
-                        replay_buffer = ReplayBuffer.copy_from_store(
-                            src_store=zip_store, store=zarr.MemoryStore()
-                        )
-                    print("Loaded!")
+        elif cfg.aug_mode == "none":
+            self.aug = None
         else:
-            replay_buffer = _convert_real_to_dp_replay(
-                store=zarr.MemoryStore(),
-                shape_meta=shape_meta,
-                dataset_dir=dataset_dir,
-                action_mode=self.action_mode,
-            )
-        self.replay_buffer = replay_buffer
+            raise ValueError(f"Invalid augmentation mode: {cfg.aug_mode}")
+
+        train_dir = os.path.join(dataset_dir, "train")
+        self.replay_buffer = load_replay_buffer(train_dir, use_cache, shape_meta)
 
         rgb_keys = list()
         depth_keys = list()
@@ -393,18 +327,8 @@ class SimAlohaDataset(BaseImageDataset):
             elif type == "low_dim":
                 lowdim_keys.append(key)
 
-        if not manual_val_mask:
-            val_mask = get_val_mask(
-                n_episodes=replay_buffer.n_episodes, val_ratio=val_ratio, seed=seed
-            )
-        else:
-            assert manual_val_start >= 0, "manual_val_start must be >= 0"
-            assert (
-                manual_val_start < replay_buffer.n_episodes
-            ), "manual_val_start too large"
-            val_mask = np.zeros((replay_buffer.n_episodes,), dtype=np.bool)
-            val_mask[manual_val_start:] = True
-        train_mask = ~val_mask
+        train_mask = np.ones((self.replay_buffer.n_episodes,), dtype=bool)
+        all_keys = list(self.replay_buffer.keys())
 
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
@@ -412,6 +336,10 @@ class SimAlohaDataset(BaseImageDataset):
             pad_before=pad_before,
             pad_after=pad_after,
             episode_mask=train_mask,
+            goal_sample=cfg.goal_sample,
+            keys=all_keys,
+            skip_frame=cfg.skip_frame,
+            keys_to_keep_intermediate=["action"],
         )
 
         self.shape_meta = shape_meta
@@ -419,16 +347,12 @@ class SimAlohaDataset(BaseImageDataset):
         self.depth_keys = depth_keys
         self.lowdim_keys = lowdim_keys
         self.train_mask = train_mask
-        self.val_mask = val_mask
-        self.horizon = horizon
-        self.downsample_horizon = cfg.horizon
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.dataset_dir = dataset_dir
         self.skip_frame = cfg.skip_frame
-        self.delta_action = cfg.delta_action
-        if self.delta_action:
-            self.kin_helper = KinHelper("trossen_vx300s")
+        self.goal_sample = cfg.goal_sample
+        self.use_cache = use_cache
 
     def get_normalizer(self, mode: str = "none", **kwargs: dict) -> LinearNormalizer:
         """Return a normalizer for the dataset."""
@@ -436,10 +360,7 @@ class SimAlohaDataset(BaseImageDataset):
 
         # action
         stat = array_to_stats(self.replay_buffer["action"])
-        if self.delta_action:
-            this_normalizer = get_hundred_times_normalizer_from_stat(stat)
-        else:
-            this_normalizer = get_range_normalizer_from_stat(stat)
+        this_normalizer = get_range_normalizer_from_stat(stat)
         normalizer["action"] = this_normalizer
 
         # obs
@@ -470,17 +391,65 @@ class SimAlohaDataset(BaseImageDataset):
         return normalizer
 
     def __len__(self) -> int:
-        return len(self.sampler)
+        if self.is_val:
+            # the number of episodes in the validation set
+            return self.replay_buffer.n_episodes // self.skip_idx
+        else:
+            return len(self.sampler)
+
+    def get_validation_dataset(self) -> "BaseImageDataset":
+        """Return a validation dataset."""
+        val_set = copy.copy(self)
+        val_set.is_val = True
+        val_dir = os.path.join(self.dataset_dir, "val")
+        shape_meta = self.shape_meta
+        use_cache = self.use_cache
+        val_set.replay_buffer = load_replay_buffer(val_dir, use_cache, shape_meta)
+        val_mask = np.ones((val_set.replay_buffer.n_episodes,), dtype=bool)
+        val_set.sampler = SequenceSampler(
+            replay_buffer=val_set.replay_buffer,
+            sequence_length=self.val_horizon,
+            pad_before=self.pad_before,
+            pad_after=self.pad_after,
+            episode_mask=val_mask,
+            skip_idx=self.skip_idx,
+            goal_sample=self.goal_sample,
+            skip_frame=self.skip_frame,
+            keys_to_keep_intermediate=["action"],
+        )
+        val_set.train_mask = val_mask
+        return val_set
 
     def _sample_to_data(self, sample: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         obs_dict = dict()
-        skip_start = np.random.randint(0, self.skip_frame)
+        final_dict = dict()
+
+        # Apply augmentation with 0.2 probability
+        apply_aug = np.random.random() < 0.2 if self.aug_mode == "img_aug" else False
+
+        # skip_start = np.random.randint(0, self.skip_frame) + self.skip_frame
         for key in self.rgb_keys:
             # move channel last to channel first
             # T,H,W,C
             # convert uint8 image to float32
-            obs_dict[key] = np.moveaxis(sample[key], -1, 1).astype(np.float32) / 255.0
-            obs_dict[key] = obs_dict[key][skip_start :: self.skip_frame]
+            obs_images = sample[key].astype(np.uint8)
+            final_images = sample[f"{key}_final"].astype(np.uint8)
+
+            # Apply augmentation if probability condition is met
+            if apply_aug:
+                aug_det = self.aug.to_deterministic()
+                combined = [*obs_images, final_images]
+                # apply the deterministic augmenter separately to each image
+                combined_aug = [aug_det.augment_image(img) for img in combined]
+                obs_images = np.stack(combined_aug[:-1], axis=0)
+                final_images = combined_aug[-1]  # Last image
+
+            obs_dict[key] = np.moveaxis(obs_images, -1, 1).astype(np.float32) / 255.0
+            # obs_dict[key] = obs_dict[key][skip_start :: self.skip_frame]
+            final_dict[key] = (
+                np.moveaxis(final_images, -1, 0).astype(np.float32) / 255.0
+            )
+            del sample[f"{key}_final"]
             # T,C,H,W
             del sample[key]
         for key in self.depth_keys:
@@ -488,115 +457,128 @@ class SimAlohaDataset(BaseImageDataset):
             # T,H,W,C
             # convert uint16 image to float32
             obs_dict[key] = np.moveaxis(sample[key], -1, 1).astype(np.float32) / 1000.0
-            obs_dict[key] = obs_dict[key][skip_start :: self.skip_frame]
+            # obs_dict[key] = obs_dict[key][skip_start :: self.skip_frame]
+            final_dict[key] = (
+                np.moveaxis(sample[f"{key}_final"], -1, 0).astype(np.float32) / 1000.0
+            )
+            del sample[f"{key}_final"]
             # T,C,H,W
             del sample[key]
         for key in self.lowdim_keys:
             obs_dict[key] = sample[key].astype(np.float32)
-            obs_dict[key] = obs_dict[key][skip_start :: self.skip_frame]
+            # obs_dict[key] = obs_dict[key][skip_start :: self.skip_frame]
+            final_dict[key] = sample[f"{key}_final"].astype(np.float32)
+            del sample[f"{key}_final"]
             del sample[key]
 
         actions = sample["action"].astype(np.float32)
-        actions = actions[skip_start :: self.skip_frame]
-        if self.delta_action:
-            joint_pos = obs_dict["joint_pos"].astype(np.float32)
-            robot_bases = self.robot_bases
-            # compute ee pos in robot_bases[0]
-            num_robot = joint_pos.shape[1] // 7
-            world_t_ee_pose = np.zeros((joint_pos.shape[0], num_robot, 4, 4))
-            for i in range(num_robot):
-                for t in range(joint_pos.shape[0]):
-                    joint_fk = np.concatenate(
-                        [
-                            joint_pos[t, i * 7 : (i + 1) * 7],
-                            joint_pos[t, i * 7 + 6 : (i + 1) * 7],
-                        ]
-                    )
-                    ee_pose = self.kin_helper.compute_fk_from_link_idx(
-                        joint_fk, [self.kin_helper.sapien_eef_idx]
-                    )[0]
-                    world_t_ee_pose[t, i] = robot_bases[i] @ ee_pose
-            if self.action_mode == "bimanual_push":
-                d_actions = np.zeros_like(actions)
-                d_actions[..., :2] = actions[..., :2] - world_t_ee_pose[:, 0:1, :2, 3]
-                d_actions[..., 2:] = actions[..., 2:] - world_t_ee_pose[:, 1:2, :2, 3]
-                actions = d_actions
-            elif self.action_mode == "single_ee":
-                d_actions = np.zeros_like(actions)
-                d_actions[..., :3] = actions[..., :3] - world_t_ee_pose[:, 1:2, :3, 3]
-                d_actions[..., 3:4] = (
-                    actions[..., 3:4] - joint_pos[:, 13:14][:, None]
-                ) / 100
-            else:
-                raise NotImplementedError
+        # action_dim = actions.shape[-1]
+        # downsample_horizon = actions.shape[0] // self.skip_frame - 1
+        # action_len = downsample_horizon * self.skip_frame
+        # action_start = skip_start - self.skip_frame
+        # actions = actions[action_start : action_start + action_len]
+        # actions = actions.reshape(downsample_horizon, self.skip_frame, action_dim)
+        # actions = actions.reshape(downsample_horizon, self.skip_frame * action_dim)
         data = {
             "obs": dict_apply(obs_dict, torch.from_numpy),
+            "goal": dict_apply(final_dict, torch.from_numpy),
             "action": torch.from_numpy(actions),
+            "is_early_stop": torch.from_numpy(np.array([sample["is_early_stop"]])),
+            "rel_stop_idx": torch.from_numpy(np.array([sample["rel_stop_idx"]])),
         }
         return data
 
-    def get_validation_dataset(self):
-        val_set = copy.copy(self)
-        val_set.sampler = SequenceSampler(
-            replay_buffer=self.replay_buffer,
-            sequence_length=self.horizon,
-            pad_before=self.pad_before,
-            pad_after=self.pad_after,
-            episode_mask=~self.train_mask,
-        )
-        val_set.train_mask = ~self.train_mask
-        return val_set
-    
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample = self.sampler.sample_sequence(idx)
+        if self.is_val:
+            epi_idx = idx * self.skip_idx
+            epi_start = (
+                self.replay_buffer.episode_ends[epi_idx - 1] if epi_idx > 0 else 0
+            )
+            epi_end = self.replay_buffer.episode_ends[epi_idx]
+            val_horizon = self.val_horizon
+            seq_end = min(epi_end, epi_start + val_horizon)
+            sample = dict()
+            for key in self.sampler.keys:
+                sample[key] = self.replay_buffer[key][epi_start:seq_end]
+                if sample[key].shape[0] < val_horizon:
+                    pad_len = val_horizon - sample[key].shape[0]
+                    pad_shape = (pad_len, *np.ones_like(sample[key].shape[1:]).tolist())
+                    sample_pad = np.tile(sample[key][-1:], pad_shape)
+                    sample[key] = np.concatenate([sample[key], sample_pad], axis=0)
+                if key in self.sampler.keys_to_keep_intermediate:
+                    inter_frames = sample[key].shape[0] // self.skip_frame
+                    sample_shape = list(sample[key].shape[1:])
+                    sample_shape[0] = sample_shape[0] * self.skip_frame
+                    sample[key] = sample[key].reshape(
+                        inter_frames, self.skip_frame, *sample[key].shape[1:]
+                    )
+                    sample[key] = sample[key].reshape(-1, *sample_shape)
+                else:
+                    sample[key] = sample[key][:: self.skip_frame]
+                sample[f"{key}_final"] = sample[key][-1]
+                sample["is_early_stop"] = False
+                sample["rel_stop_idx"] = val_horizon - 1
+        else:
+            sample = self.sampler.sample_sequence(idx)
         data = self._sample_to_data(sample)
         return data
 
 
-def test_kf_dataset() -> None:
-    config_path = (
-        "/home/yixuan/diffusion-forcing/configurations/dataset/sim_aloha_dataset.yaml"
-    )
+def test_sim_aloha_dataset() -> None:
+    config_path = "configurations/dataset/sim_aloha_dataset.yaml"
     cfg = OmegaConf.load(config_path)
     # cfg.dataset_dir = "/media/yixuan/Extreme SSD/projects/diffusion-forcing/data/sim_aloha/single_arm_transfer_cube_0407_v3"  # noqa
     # cfg.dataset_dir = "/media/yixuan/Extreme SSD/projects/diffusion-forcing/data/sim_aloha/pusht_test_0414"  # noqa
-    cfg.dataset_dir = "/media/yixuan/Extreme SSD/projects/diffusion-forcing/data/sim_aloha/pusht_0407"  # noqa
-    cfg.delta_action = False
-    cfg.action_mode = "bimanual_push"
+    # cfg.dataset_dir = "/media/yixuan/Extreme SSD/projects/diffusion-forcing/data/sim_aloha/pusht_0407"  # noqa
+    cfg.dataset_dir = "data/scripted_sim_aloha_10000"
+    cfg.horizon = 10
     cfg.shape_meta.action.shape = (4,)
-    cfg.skip_frame = 3
+    cfg.skip_frame = 1
+    cfg.skip_idx = 4
+    cfg.val_horizon = 200
+    cfg.goal_sample = "aggressive"
+    cfg.resolution = 128
     dataset = SimAlohaDataset(cfg)
-    dataset.get_normalizer()
-    print(dataset[200])
-    print("success!")
-
-
-def visualize_kf_dataset() -> None:
-    config_path = (
-        "/home/yixuan/diffusion-forcing/configurations/dataset/sim_aloha_dataset.yaml"
-    )
-    cfg = OmegaConf.load(config_path)
-    dataset = SimAlohaDataset(cfg)
-    replay_buffer = dataset.replay_buffer
-    camera_0_rgb = replay_buffer["teleoperator_pov"]
-    episode_ends = replay_buffer.episode_ends
-
-    for i in range(len(episode_ends)):
-        if i == 0:
-            s = 0
-        else:
-            s = episode_ends[i - 1]
-        e = episode_ends[i]
-
-        imgs = camera_0_rgb[s:e]
-        imageio.mimsave(f"sim_aloha_data_episode_{i}.mp4", np.stack(imgs), fps=25)
-
     print(len(dataset))
-    data = dataset[0]
+
+    p = psutil.Process(os.getpid())
+
+    def rss() -> float:
+        return p.memory_info().rss / 1e9
+
+    print(f"START RSS: {rss():.3f} GB")
+    k = min(2000, len(dataset))  # enough iterations to see creep
+    for i in range(k):
+        _ = dataset[i]  # exercises __getitem__
+        if (i + 1) % 50 == 0:
+            gc.collect()
+            print(f"i={i+1} RSS={rss():.3f} GB")
+
+    cpu_count = os.cpu_count()
+    assert cpu_count is not None
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=16,
+        num_workers=min(cpu_count, 16),
+        shuffle=False,
+        persistent_workers=False,
+        pin_memory=False,
+        prefetch_factor=1,
+    )
+    i = 0
+    for _ in dataloader:
+        i += 1
+        if (i + 1) % 50 == 0:
+            gc.collect()
+            print(f"i={i+1} RSS={rss():.3f} GB")
+
+    val_dataset = dataset.get_validation_dataset()
+    print(len(val_dataset))
+    for i in range(len(val_dataset)):
+        data = val_dataset[i]
     print(data)
-    print("success!")
+    print("validation dataset success!")
 
 
 if __name__ == "__main__":
-    test_kf_dataset()
-    # visualize_kf_dataset()
+    test_sim_aloha_dataset()

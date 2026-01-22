@@ -52,6 +52,17 @@ class BaseLowdimDataset(torch.utils.data.Dataset):
 
 
 class BaseImageDataset(torch.utils.data.Dataset):
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.is_train = True
+        self.is_val = False
+        self.is_test = False
+
+        self.train_mask = None
+        self.val_mask = None
+        self.test_mask = None
+    
     def get_validation_dataset(self) -> "BaseImageDataset":
         # return an empty dataset by default
         return BaseImageDataset()

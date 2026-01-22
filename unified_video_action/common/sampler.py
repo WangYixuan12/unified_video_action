@@ -1,12 +1,9 @@
-from typing import Optional
-import numpy as np
+from typing import Any, Dict, List, Optional, Tuple
+
 import numba
-from unified_video_action.common.replay_buffer import ReplayBuffer
-import random
-import scipy.interpolate as si
-import scipy.spatial.transform as st
-import json
-import os
+import numpy as np
+
+from .replay_buffer import ReplayBuffer
 
 
 @numba.jit(nopython=True)
@@ -18,10 +15,9 @@ def create_indices(
     pad_after: int = 0,
     debug: bool = True,
 ) -> np.ndarray:
-
-    episode_mask.shape == episode_ends.shape
-    pad_before = min(max(pad_before, 0), sequence_length - 1)  # 1
-    pad_after = min(max(pad_after, 0), sequence_length - 1)  # 7
+    assert episode_mask.shape == episode_ends.shape, "Invalid episode mask"
+    pad_before = min(max(pad_before, 0), sequence_length - 1)
+    pad_after = min(max(pad_after, 0), sequence_length - 1)
 
     indices = list()
     for i in range(len(episode_ends)):
@@ -34,8 +30,8 @@ def create_indices(
         end_idx = episode_ends[i]
         episode_length = end_idx - start_idx
 
-        min_start = -pad_before  # -1
-        max_start = episode_length - sequence_length + pad_after  # 93
+        min_start = -pad_before
+        max_start = episode_length - sequence_length + pad_after
 
         # range stops one idx before end
         for idx in range(min_start, max_start + 1):
@@ -58,35 +54,31 @@ def create_indices(
     return indices
 
 
-def get_val_mask(n_episodes, val_ratio, seed=0):
+def get_val_mask(n_episodes: int, val_ratio: float, seed: int = 0) -> np.ndarray:
     val_mask = np.zeros(n_episodes, dtype=bool)
     if val_ratio <= 0:
         return val_mask
 
     # have at least 1 episode for validation, and at least 1 episode for train
     n_val = min(max(1, round(n_episodes * val_ratio)), n_episodes - 1)
-    rng = np.random.default_rng(seed=seed)
-    val_idxs = rng.choice(n_episodes, size=n_val, replace=False)
-    print("---------------------------------------------------------")
-    print(f"Validation episodes: {val_idxs}")
-    print("---------------------------------------------------------")
-    val_mask[val_idxs] = True
+    # rng = np.random.default_rng(seed=seed)
+    # val_idxs = rng.choice(n_episodes, size=n_val, replace=False)
+    # val_mask[val_idxs] = True
+    val_mask[-n_val:] = True  # last n_val episodes are validation
     return val_mask
 
 
-def downsample_mask(mask, max_n, seed=0):
-    # max_n: 90
+def downsample_mask(
+    mask: np.ndarray, max_n: Optional[int], seed: int = 0
+) -> np.ndarray:
     # subsample training data
     train_mask = mask
     if (max_n is not None) and (np.sum(train_mask) > max_n):
-        n_train = int(max_n)  # 90
+        n_train = int(max_n)
         curr_train_idxs = np.nonzero(train_mask)[0]
         rng = np.random.default_rng(seed=seed)
         train_idxs_idx = rng.choice(len(curr_train_idxs), size=n_train, replace=False)
         train_idxs = curr_train_idxs[train_idxs_idx]
-        print("---------------------------------------------------------")
-        print(f"Training episodes: {train_idxs}")
-        print("---------------------------------------------------------")
         train_mask = np.zeros_like(train_mask)
         train_mask[train_idxs] = True
         assert np.sum(train_mask) == n_train
@@ -94,21 +86,27 @@ def downsample_mask(mask, max_n, seed=0):
 
 
 class SequenceSampler:
+    """Sample sequences from replay buffer."""
+
     def __init__(
         self,
         replay_buffer: ReplayBuffer,
         sequence_length: int,
         pad_before: int = 0,
         pad_after: int = 0,
-        keys=None,
-        key_first_k=dict(),
+        keys: Optional[List[str]] = None,
+        key_first_k: Dict[str, int] = dict(),  # noqa
         episode_mask: Optional[np.ndarray] = None,
+        skip_idx: int = 1,
+        goal_sample: str = "final",
+        skip_frame: int = 1,
+        keys_to_keep_intermediate: Optional[List[str]] = None,
     ):
-        """
-        key_first_k: dict str: int
-            Only take first k data from these keys (to improve perf)
-        """
+        """Initialize sequence sampler.
 
+        key_first_k: dict str: int
+        Only take first k data from these keys (to improve perf)
+        """
         super().__init__()
         assert sequence_length >= 1
         if keys is None:
@@ -129,22 +127,66 @@ class SequenceSampler:
         else:
             indices = np.zeros((0, 4), dtype=np.int64)
 
+        # (buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx)
         self.indices = indices
         self.keys = list(keys)  # prevent OmegaConf list performance problem
         self.sequence_length = sequence_length
         self.replay_buffer = replay_buffer
         self.key_first_k = key_first_k
+        self.episode_ends = episode_ends
+        self.skip_idx = skip_idx
+        self.goal_sample = goal_sample
+        self.skip_frame = skip_frame
+        if keys_to_keep_intermediate is None:
+            keys_to_keep_intermediate = list()
+        self.keys_to_keep_intermediate = keys_to_keep_intermediate
 
-        
-    def __len__(self):
-        return len(self.indices)
+    def __len__(self) -> int:
+        return len(self.indices) // self.skip_idx
 
-    def sample_sequence(self, idx):
+    def idx_to_epi_idx(self, idx: int) -> Tuple[int, int]:
+        """Get episode index and offset from sequence index."""
         buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx = (
             self.indices[idx]
         )
+        return self.buffer_idx_to_epi_idx(buffer_start_idx)
 
+    def buffer_idx_to_epi_idx(self, buffer_idx: int) -> Tuple[int, int]:
+        """Get episode index and offset from buffer index."""
+        epi_idx = np.searchsorted(self.episode_ends, buffer_idx, side="right")
+        epi_offset = (
+            buffer_idx - self.episode_ends[epi_idx - 1] if epi_idx > 0 else buffer_idx
+        )
+        return epi_idx, epi_offset
+
+    def sample_sequence(self, idx: int) -> Dict[str, np.ndarray]:
+        """Sample a sequence."""
+        buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx = (
+            self.indices[idx * self.skip_idx]
+        )
         result = dict()
+
+        epi_idx, epi_offset = self.buffer_idx_to_epi_idx(buffer_start_idx)
+        episode_end = self.episode_ends[epi_idx]
+        is_early_stop = False
+        rel_stop_idx = -1
+        if self.goal_sample == "final":
+            final_idx = episode_end - 1
+        elif self.goal_sample == "intermediate":
+            intermediate_start = min(buffer_end_idx, episode_end - 1)
+            final_idx = np.random.randint(intermediate_start, episode_end)
+        elif self.goal_sample == "aggressive":
+            early_stop_prob = 0.2
+            is_early_stop = np.random.rand() < early_stop_prob
+            if is_early_stop:
+                rel_stop_idx = np.random.randint(
+                    0, self.sequence_length // self.skip_frame
+                )
+            else:
+                intermediate_start = min(buffer_end_idx, episode_end - 1)
+                final_idx = np.random.randint(intermediate_start, episode_end)
+        else:
+            raise ValueError(f"Invalid goal sample: {self.goal_sample}")
         for key in self.keys:
             input_arr = self.replay_buffer[key]
             # performance optimization, avoid small allocation if possible
@@ -161,22 +203,140 @@ class SequenceSampler:
                     fill_value=np.nan,
                     dtype=input_arr.dtype,
                 )
-                try:
-                    sample[:k_data] = input_arr[
-                        buffer_start_idx : buffer_start_idx + k_data
-                    ]
-                except Exception as e:
-                    raise e
+                sample[:k_data] = input_arr[
+                    buffer_start_idx : buffer_start_idx + k_data
+                ]
             data = sample
+            # is_pad = np.zeros(self.sequence_length, dtype=bool)
             if (sample_start_idx > 0) or (sample_end_idx < self.sequence_length):
                 data = np.zeros(
-                    shape=(self.sequence_length,) + input_arr.shape[1:],
-                    dtype=input_arr.dtype,
+                    shape=(self.sequence_length,) + data.shape[1:], dtype=data.dtype
                 )
                 if sample_start_idx > 0:
                     data[:sample_start_idx] = sample[0]
+                    # is_pad[:sample_start_idx] = True
                 if sample_end_idx < self.sequence_length:
                     data[sample_end_idx:] = sample[-1]
+                    # is_pad[sample_end_idx:] = True
                 data[sample_start_idx:sample_end_idx] = sample
+            if key in self.keys_to_keep_intermediate:
+                inter_frames = self.sequence_length // self.skip_frame
+                data_shape = list(data.shape[1:])
+                data_shape[0] = data_shape[0] * self.skip_frame
+                result[key] = data.reshape(
+                    inter_frames, self.skip_frame, *data.shape[1:]
+                )
+                result[key] = result[key].reshape(-1, *data_shape)
+                # is_pad_shape = list(is_pad.shape[1:])
+                # is_pad_shape[0] = is_pad_shape[0] * self.skip_frame
+                # result[f"{key}_is_pad"] = \
+                #   is_pad.reshape(inter_frames, self.skip_frame, *is_pad.shape[1:])
+                # result[f"{key}_is_pad"] = \
+                #   result[f"{key}_is_pad"].reshape(-1, *is_pad_shape)
+            else:
+                result[key] = data[:: self.skip_frame]
+                # result[f"{key}_is_pad"] = is_pad[:: self.skip_frame]
+            if self.goal_sample == "aggressive" and is_early_stop:
+                # sample[rel_stop_idx:] = np.repeat(
+                #     sample[rel_stop_idx][None], len(sample) - rel_stop_idx, axis=0
+                # )
+                final_obs = result[key][rel_stop_idx]
+            else:
+                final_obs = input_arr[final_idx]
+            result[f"{key}_final"] = final_obs
+            result["is_early_stop"] = is_early_stop
+            result["rel_stop_idx"] = rel_stop_idx
+        return result
+
+    def sample_pair_from_buffer_idx(
+        self,
+        buffer_idx: int,
+        neg_prob: float = 0.8,
+        pos_range: int = 5,
+        neg_range: int = 50,
+    ) -> Dict[str, Any]:
+        """Sample another step from the same episode of idx."""
+        epi_idx, _ = self.buffer_idx_to_epi_idx(buffer_idx)
+        epi_buffer_idx_start = self.episode_ends[epi_idx - 1] if epi_idx > 0 else 0
+        epi_buffer_idx_end = self.episode_ends[epi_idx]
+        if (
+            epi_buffer_idx_end <= buffer_idx + neg_range
+            and epi_buffer_idx_start >= buffer_idx - neg_range
+        ):
+            # not enough data for negative sample
+            neg_prob = 0.0
+        if np.random.rand() < neg_prob:
+            # sample negative pair
+            idx_selections = []
+            if epi_buffer_idx_end > buffer_idx + neg_range:
+                idx_selections.append(
+                    np.arange(buffer_idx + neg_range, epi_buffer_idx_end)
+                )
+            if epi_buffer_idx_start < buffer_idx - neg_range:
+                idx_selections.append(
+                    np.arange(epi_buffer_idx_start, buffer_idx - neg_range)
+                )
+            idx_selections = np.concatenate(idx_selections)
+            neg_idx = np.random.choice(idx_selections)
+            return {
+                "idx": neg_idx,
+                "is_positive": False,
+                "offset": neg_idx - epi_buffer_idx_start,
+                "epi_len": epi_buffer_idx_end - epi_buffer_idx_start,
+            }
+        else:
+            # sample positive pair
+            pos_idx = np.random.randint(
+                max(epi_buffer_idx_start, buffer_idx - pos_range),
+                min(epi_buffer_idx_end, buffer_idx + pos_range),
+            )
+            return {
+                "idx": pos_idx,
+                "is_positive": True,
+                "offset": pos_idx - epi_buffer_idx_start,
+                "epi_len": epi_buffer_idx_end - epi_buffer_idx_start,
+            }
+
+    def sample_pairs(
+        self, idx: int, neg_prob: float = 0.8, pos_range: int = 5, neg_range: int = 50
+    ) -> Dict[str, Any]:
+        """Sample_pairs."""
+        buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx = (
+            self.indices[idx * self.skip_idx]
+        )
+        pair_info = self.sample_pair_from_buffer_idx(
+            buffer_start_idx, neg_prob, pos_range, neg_range
+        )
+        result: dict = dict()
+        result["pair"] = dict()
+        result["pair"]["is_positive"] = pair_info["is_positive"]
+        result["pair"]["offset"] = pair_info["offset"]
+        result["pair"]["epi_len"] = pair_info["epi_len"]
+
+        for key in self.keys:
+            input_arr = self.replay_buffer[key]
+            sample = input_arr[buffer_start_idx:buffer_end_idx]
+            data = sample
+
+            # pad the data
+            # is_pad = np.zeros(self.sequence_length, dtype=bool)
+            if (sample_start_idx > 0) or (sample_end_idx < self.sequence_length):
+                data = np.zeros(
+                    shape=(self.sequence_length,) + data.shape[1:], dtype=data.dtype
+                )
+                if sample_start_idx > 0:
+                    data[:sample_start_idx] = sample[0]
+                    # is_pad[:sample_start_idx] = True
+                if sample_end_idx < self.sequence_length:
+                    data[sample_end_idx:] = sample[-1]
+                    # is_pad[sample_end_idx:] = True
+                data[sample_start_idx:sample_end_idx] = sample
+
+            # save the data
             result[key] = data
+            # result[f"{key}_is_pad"] = is_pad
+            result["offset"] = self.buffer_idx_to_epi_idx(buffer_start_idx)[1]
+            result["pair"][key] = input_arr[pair_info["idx"]][None]
+            result["epi_len"] = pair_info["epi_len"]
+
         return result
