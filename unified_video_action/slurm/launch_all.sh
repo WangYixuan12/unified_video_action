@@ -1,0 +1,7 @@
+sbatch slurm/train_sim_aloha_dtai.slurm
+sbatch slurm/train_real_pusht_dtai.slurm
+sbatch slurm/train_real_bimanual_rope_dtai.slurm
+sbatch slurm/train_real_bimanual_sweep_dtai.slurm
+sbatch slurm/train_real_single_grasp_dtai.slurm
+sbatch slurm/train_real_single_chain_dtai.slurm
+sbatch slurm/train_real_bimanual_box_dtai.slurm
